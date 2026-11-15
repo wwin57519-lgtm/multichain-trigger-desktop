@@ -1,0 +1,43 @@
+{
+  "name": "base-trigger-desktop",
+  "version": "0.5.4",
+  "private": true,
+  "description": "Local multi-chain authorized trigger",
+  "author": "Local Tools",
+  "main": "src/main.cjs",
+  "dependencies": {
+    "ethers": "6.17.0",
+    "ws": "8.21.0"
+  },
+  "productName": "Base Trigger Desktop",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win nsis --x64 --publish never",
+    "build:contracts": "node scripts/build-contracts.cjs",
+    "test": "node --test test/*.test.cjs",
+    "smoke": "electron . --verify-startup"
+  },
+  "devDependencies": {
+    "electron": "44.5.1",
+    "electron-builder": "26.18.0",
+    "solc": "0.8.36"
+  },
+  "build": {
+    "artifactName": "MultiChain-Trigger-Desktop-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "renderer/**/*",
+      "artifacts/**/*",
+      "THIRD_PARTY_NOTICES.md"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    }
+  },
+  "license": "MIT"
+}
