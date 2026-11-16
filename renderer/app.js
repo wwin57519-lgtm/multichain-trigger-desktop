@@ -168,6 +168,10 @@
   function emptyRow(tbody, columns, value) { const row = document.createElement('tr'); const cell = document.createElement('td'); cell.colSpan = columns; cell.className = 'empty'; text(cell, value); row.append(cell); tbody.append(row); }
   function applyContract(contract) {
     state.contract = contract && isAddress(contract.address) ? contract : null;
+    const v4 = state.contract?.family === 'v4';
+    for (const id of ['liquidity-router', 'liquidity-token']) show($(id).closest('.field'), !v4);
+    const liquidityHelp = $('listen-liquidity').closest('label').querySelector('small');
+    text(liquidityHelp, v4 ? '按执行合约的候选池和锁定池匹配 V4 流动性。' : '匹配 V2 添加流动性和 V3 仓位操作，可按地址筛选。');
     state.contractClock = state.contract ? observeChain(state.contractClock, contract.blockTimestamp, contract.blockObservedAt, `${contract.address}:${contract.triggerEpoch}`) : null;
     $('contract-summary').replaceChildren(); show($('contract-summary'), Boolean(state.contract)); show($('contract-warning'), false);
     if (!state.contract) { badge($('contract-status'), '未读取'); text($('contract-detail'), '本程序只负责触发，不修改 owner 设置。'); text($('trigger-epoch'), '—'); sync(); return; }
@@ -176,9 +180,14 @@
     if(contract.dex===1){$('liquidity-router').value='0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43';if(!$('liquidity-token').value)$('liquidity-token').value=contract.settings?.tokenOut||'';}
     text($('contract-detail'), `Owner：${contract.owner || '未知'} · 版本 ${contract.version || '待确认'}`); text($('trigger-epoch'), contract.triggerEpoch ?? '—');
     const settings = contract.settings || {}; const policy = contract.policy || {};
-    const entries = [['交易所',contract.dex===1?'Aerodrome · 普通池 / Slipstream':'Uniswap'],['支付代币', settings.tokenIn], ['获得代币', settings.tokenOut], ['购买收款地址（无提款权限）', settings.recipient], ['本轮状态', contract.executed ? '已经执行' : '尚未执行'], ['自动支付数量（最小单位）', String(policy.amountIn)==='0'?'使用执行时全部支付币余额':policy.amountIn==null?'未读取':`${policy.amountIn} 最小单位；不是常用显示数量`], ['固定最低购入量（最小单位）',settings.minBuyAmount==null?'未读取':`${settings.minBuyAmount} 获得币最小单位（试卖前）`], ['自动滑点', policy.slippageBps == null ? '—' : `${Number(policy.slippageBps) / 100}%`], ['链上最早时间', formatPolicyTime(policy.notBefore)], ['链上失效时间', formatPolicyTime(policy.expiresAt)]];
+    const dexNames = v4 ? { 0: 'Uniswap V4', 2: 'PancakeSwap Infinity' } : { 0: 'Uniswap', 1: 'Aerodrome · 普通池 / Slipstream', 2: 'PancakeSwap' };
+    const entries = [['交易所',dexNames[contract.dex]],['支付代币', settings.tokenIn], ['获得代币', settings.tokenOut], ['购买收款地址（无提款权限）', settings.recipient], ['本轮状态', contract.executed ? '已经执行' : '尚未执行'], ['自动支付数量（最小单位）', String(policy.amountIn)==='0'?(contract.strictTriggerLimits?'尚未设定':'使用执行时全部支付币余额'):policy.amountIn==null?'未读取':`${policy.amountIn} 最小单位；不是常用显示数量`], [contract.strictTriggerLimits?'最低实收（最小单位）':'固定最低购入量（最小单位）',settings.minBuyAmount==null?'未读取':settings.minBuyAmount+' 获得币最小单位'+(contract.strictTriggerLimits?'':'（试卖前）')], ['自动滑点', policy.slippageBps == null ? '—' : `${Number(policy.slippageBps) / 100}%`], ['链上最早时间', formatPolicyTime(policy.notBefore)], ['链上失效时间', formatPolicyTime(policy.expiresAt)]];
+    if (v4) {
+      const locked = contract.lockedPoolId;
+      entries.splice(1, 0, ['V4 候选池', contract.v4Pools.length], ['锁定 Pool ID', locked && !/^0x0{64}$/i.test(locked) ? locked : '使用合约的候选池']);
+    }
     for (const [label, value] of entries) { const item = document.createElement('div'); item.className = 'summary-item'; const title = document.createElement('span'); text(title, label); const content = document.createElement('strong'); text(content, value ?? '—'); item.append(title, content); $('contract-summary').append(item); }
-    if (contract.supported !== true) { text($('contract-warning'), '此地址不支持新版授权触发接口。支持部署工具 0.5.1 的 Uniswap 合约及 0.6.0 的双交易所合约；更早版本不兼容。'); show($('contract-warning'), true); }
+    if (contract.supported !== true) { text($('contract-warning'), '请加载 MultiChain Swap 或 V4 Trading 部署的受支持执行合约。'); show($('contract-warning'), true); }
     else if (contract.executed || !contract.triggerArmed) { text($('contract-warning'), contract.executed ? '本轮已经执行。请由 owner 在部署程序中设置并武装新一轮。' : '请在部署程序中授权执行钱包并武装合约，无需在此导入 owner 私钥。'); show($('contract-warning'), true); }
     sync();
   }
@@ -336,7 +345,16 @@
     if (c.mode === 'listen') {
       let ws; try { ws = new URL(c.monitorRpc); } catch { throw Error('监听模式请填写有效 WSS 节点。'); }
       if (ws.protocol !== 'wss:' && !(ws.protocol === 'ws:' && ['localhost', '127.0.0.1', '[::1]'].includes(ws.hostname))) throw Error('远程监听节点必须使用 WSS。');
-      if (c.listenLiquidity) { c.liquidityFrom = address(c.liquidityFrom, '流动性发送者', true); c.liquidityRouter = address(c.liquidityRouter, '流动性 Router'); c.liquidityToken = address(c.liquidityToken, '目标代币', true); }
+      if (c.listenLiquidity) {
+        c.liquidityFrom = address(c.liquidityFrom, '流动性发送者', true);
+        if (state.contract?.family === 'v4') {
+          c.liquidityRouter = '';
+          c.liquidityToken = '';
+        } else {
+          c.liquidityRouter = address(c.liquidityRouter, '流动性 Router');
+          c.liquidityToken = address(c.liquidityToken, '目标代币', true);
+        }
+      }
       c.customActions = c.customActions.map((action, index) => {
         const result = { ...action, from: address(action.from, `规则 ${index + 1} From`, true), to: address(action.to, `规则 ${index + 1} To`, true), gasPriceGwei: dec(action.gasPriceGwei || '0', `规则 ${index + 1} Gas`) };
         if (!result.from && !result.to && !result.selector) throw Error(`监听规则 ${index + 1} 不能全部为空。`);

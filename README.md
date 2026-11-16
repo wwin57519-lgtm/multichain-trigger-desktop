@@ -2,7 +2,9 @@
 
 通过已获所有者授权的本地钱包管理链上触发任务。 当前版本 0.5.4。
 
-支持 MultiChain Swap 部署的重写版多交易所执行器和历史执行器。所有者在 Swap 中配置授权钱包、轮次和有效期，本应用读取并检查这些授权。
+支持 MultiChain Swap 和 V4 Trading 部署的执行器，包括两套合约的重写版和已知历史版。
+
+所有者在对应的交易工具中设置合约、授权触发钱包并开启本轮。在本应用里选择同一网络、连接 RPC、读取执行合约地址，再使用已获授权的触发钱包预览任务。V4 监听使用合约保存的候选池和锁定池。
 
 ## 开发与构建
 
@@ -19,9 +21,9 @@ npm run dist:win
 
 ## 合约源码与兼容性
 
-本工程包含对应执行器及报价合约的 Solidity 源码。运行 `npm run build:contracts` 可用 Solidity 0.8.36 重编译 `artifacts/Rebuilt*.json`。合约源码来自版本固定的独立仓库。 [合约提交 4161a3c](https://github.com/wwin57519-lgtm/multichain-desktop-contracts/tree/4161a3c70b059457596ffc35b2060808581d7a1b)
+本工程包含经典执行器及其报价合约的 Solidity 源码。运行 `npm run build:contracts` 可用 Solidity 0.8.38 重编译经典合约产物。V4 的执行器和报价合约产物从 V4 Trading 同版本源码携带，经典和 V4 的初版重写源码见 [合约提交 4161a3c](https://github.com/wwin57519-lgtm/multichain-desktop-contracts/tree/4161a3c70b059457596ffc35b2060808581d7a1b)
 
-执行器重写版编号为 0.1.0。历史合约的 ABI 和字节码作为兼容性产物保留。新合约部署使用独立地址，已有合约可按其原身份加载。
+执行器重写版 0.2.0 要求自动触发前设置正数投入金额和固定最低实收。执行器在兑换、试卖和转账完成后核对收款地址实际到账。本应用保留对 0.1.0 及历史合约的识别和原有操作。部署 0.2.0 会生成独立地址。
 
 ## 许可
 

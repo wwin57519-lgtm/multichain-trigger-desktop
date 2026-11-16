@@ -40,4 +40,11 @@ function matches(config,item){
  if(item.tokens)return item.tokens.some(t=>lower(t)===lower(config.liquidityToken));
  return (config.positionIds?.[item.manager]||[]).includes(item.tokenId);
 }
-module.exports={actions,matches,uni,aero,positions,v3Positions};
+async function position(config,item,pool){
+ const iface=config.liquidityDex==='Aerodrome'?positions:v3Positions;
+ const data=iface.encodeFunctionData('positions',[item.tokenId]);
+ const raw=await pool.read('call',{to:item.manager,data});
+ const result=iface.decodeFunctionResult('positions',raw);
+ return {tokens:[result.token0,result.token1]};
+}
+module.exports={actions,matches,position,uni,aero,positions,v3Positions};

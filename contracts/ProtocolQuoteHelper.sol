@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.36;
+pragma solidity ^0.8.38;
 
 import {ClassicTypes as Types} from "./classic/ClassicTypes.sol";
 import {

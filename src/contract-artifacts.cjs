@@ -10,12 +10,36 @@ const historicalHelpers = [
 ];
 
 const versions = [
-  { version: "重写版 0.1.0", artifact: rebuiltArtifact, helpers: [rebuiltHelper] },
+  { version: "重写版 0.2.0", artifact: rebuiltArtifact, helpers: [rebuiltHelper], strictTriggerLimits: true },
+  {
+    version: "重写版 0.1.0",
+    artifact: require("../artifacts/Rebuilt010BaseSwapExecutor.json"),
+    helpers: [require("../artifacts/Rebuilt010ProtocolQuoteHelper.json")]
+  },
   { version: "0.7.0", artifact: require("../artifacts/BaseSwapExecutor.json"), helpers: historicalHelpers },
   { version: "0.6.2", artifact: require("../artifacts/Release062BaseSwapExecutor.json"), helpers: historicalHelpers },
   { version: "0.6.1", artifact: require("../artifacts/Release061BaseSwapExecutor.json"), helpers: historicalHelpers },
   { version: "0.6.0", artifact: require("../artifacts/PreviousBaseSwapExecutor.json"), helpers: historicalHelpers },
-  { version: "0.5.0", artifact: require("../artifacts/LegacyBaseSwapExecutor.json"), helpers: [] }
+  { version: "0.5.0", artifact: require("../artifacts/LegacyBaseSwapExecutor.json"), helpers: [] },
+  {
+    family: "v4",
+    version: "重写版 0.2.0",
+    artifact: require("../artifacts/RebuiltV4SwapExecutor.json"),
+    helpers: [require("../artifacts/RebuiltV4QuoteHelper.json")],
+    strictTriggerLimits: true
+  },
+  {
+    family: "v4",
+    version: "重写版 0.1.0",
+    artifact: require("../artifacts/Rebuilt010V4SwapExecutor.json"),
+    helpers: [require("../artifacts/Rebuilt010V4QuoteHelper.json")]
+  },
+  {
+    family: "v4",
+    version: "1.0.0",
+    artifact: require("../artifacts/V4SwapExecutor.json"),
+    helpers: [require("../artifacts/V4QuoteHelper.json")]
+  }
 ];
 
 function identifyExecutor(code, override) {

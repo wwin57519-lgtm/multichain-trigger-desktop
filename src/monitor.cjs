@@ -1,12 +1,16 @@
 const WebSocket=require('ws');
 const SEC=require('./listener-security.cjs');
 const LIQ=require('./liquidity.cjs');
+const V4_LIQ=require('./v4-liquidity.cjs');
+const {validateReceipt}=require('./receipt-security.cjs');
 const {rpcUrl,cleanError,units}=require('./runtime.cjs');
 const lower=x=>String(x||'').toLowerCase();
+function liquidity(config){return config.contractFamily==='v4'?V4_LIQ:LIQ;}
 function matchTransaction(config,tx){
   if (!SEC.shape(tx)) return null;
   const input=lower(tx.input||tx.data),from=lower(tx.from),to=lower(tx.to);
-  for(const action of LIQ.actions(config,tx))if(LIQ.matches(config,action))return{reason:'匹配添加流动性交易：'+action.action,followGas:config.followLiquidityGas===true,tx};
+  const adapter=liquidity(config);
+  for(const action of adapter.actions(config,tx))if(adapter.matches(config,action))return{reason:'匹配添加流动性交易：'+action.action,followGas:config.followLiquidityGas===true,tx};
   for(const rule of config.customActions||[]){
     const needle=lower(rule.selector);
     if(!rule.from&&!rule.to&&!needle)continue;
@@ -43,6 +47,12 @@ class Monitor {
    if(this.feed==='flashblocks')subscription=await this.request('eth_subscribe',['newFlashblockTransactions']);
    else{try{subscription=await this.request('eth_subscribe',['newPendingTransactions',true]);}catch(e){if(!current())return;subscription=await this.request('eth_subscribe',['newPendingTransactions']);}}
    if(!current())return;this.subscription=subscriptionId(subscription);
+   const logFilter=liquidity(this.config).logFilter?.(this.config);
+   if(logFilter){
+    const logs=await this.request('eth_subscribe',['logs',logFilter]);
+    if(!current())return;
+    this.logSubscription=subscriptionId(logs);
+   }
    this.retry=0;this.log(this.feed==='flashblocks'?'已订阅 Base 预确认交易流（交易已经排序）':'已订阅节点可见的 pending 交易','info');
   }catch(e){if(!current())return;this.running=false;clearInterval(heartbeat);socket.close();const error=Error('节点不支持所选监听方式或连接失败：'+cleanError(e));this.onFatal(error);throw error;}
  }
@@ -51,6 +61,18 @@ class Monitor {
   if(!data||typeof data!=='object'||Array.isArray(data))return;
   if (data.id) {const r=this.requests.get(data.id);if(!r)return;clearTimeout(r.timer);this.requests.delete(data.id);data.error?r.reject(Error(typeof data.error.message==='string'?data.error.message:'订阅失败')):r.resolve(data.result);return;}
   if(!this.running||this.matched||data.method!=='eth_subscription')return;
+  if(this.logSubscription&&data.params?.subscription===this.logSubscription){
+   const event=data.params.result;
+   if(!SEC.logShape(event)||!V4_LIQ.logMatch(this.config,event))return;
+   const key='log:'+lower(event.transactionHash)+':'+SEC.index(event);
+   if(this.seen.has(key))return;
+   if(this.queue.length>=2000){this.onFatal(Error('监听事件队列超过节点处理能力，已停止'));this.stop();return;}
+   this.seen.add(key);
+   if(this.seen.size>10000)this.seen.delete(this.seen.values().next().value);
+   this.queue.push({listenerLog:event,hash:key});
+   this.pump();
+   return;
+  }
   // Ignore frames until a chain-checked subscription has been acknowledged.
   if(!this.subscription||data.params?.subscription!==this.subscription)return;
   let item=data.params?.result; if(item?.transaction)item=item.transaction;
@@ -65,16 +87,62 @@ class Monitor {
   this.queue.push(item);this.pump();
  }
  async transaction(hash){const generation=this.connectionGeneration;for(let i=0;i<3&&this.running&&!this.matched&&generation===this.connectionGeneration;i++){let tx;try{tx=await this.request('eth_getTransactionByHash',[hash]);}catch{}if(generation!==this.connectionGeneration)return null;if(tx)return SEC.bound(tx,hash);if(i<2)await new Promise(r=>setTimeout(r,100*(i+1)));}if(this.running&&!this.matched&&generation===this.connectionGeneration){const tx=await this.pool.read('getTransaction',hash);if(!this.running||generation!==this.connectionGeneration)return null;return SEC.bound(tx,hash);}return null;}
- pump(){while(this.running&&!this.matched&&this.workers<6&&this.queue.length){const item=this.queue.shift(),hash=typeof item==='string'?item:item?.hash,generation=this.connectionGeneration;this.workers++;(typeof item==='object'?Promise.resolve(item):this.transaction(item)).then(tx=>{if(generation!==this.connectionGeneration)return;if(tx)return this.inspect(tx);else this.seen.delete(hash);}).catch(e=>{if(generation!==this.connectionGeneration)return;this.seen.delete(hash);this.log('监听交易读取失败：'+cleanError(e),'warn');}).finally(()=>{this.workers--;this.pump();});}}
+ pump(){
+  while(this.running&&!this.matched&&this.workers<6&&this.queue.length){
+   const item=this.queue.shift(),hash=typeof item==='string'?item:item?.hash,generation=this.connectionGeneration;
+   this.workers++;
+   const work=item?.listenerLog?this.inspectLog(item.listenerLog):typeof item==='object'?Promise.resolve(item):this.transaction(item);
+   work.then(tx=>{
+    if(generation!==this.connectionGeneration)return;
+    if(tx)return this.inspect(tx);
+    if(!this.matched)this.seen.delete(hash);
+   }).catch(e=>{
+    if(generation!==this.connectionGeneration)return;
+    this.seen.delete(hash);
+    this.log('监听交易读取失败：'+cleanError(e),'warn');
+   }).finally(()=>{this.workers--;this.pump();});
+  }
+ }
+ async inspectLog(log){
+  const generation=this.connectionGeneration;
+  const active=()=>this.running&&!this.matched&&generation===this.connectionGeneration;
+  if(!active()||!SEC.logShape(log))return;
+  const item=V4_LIQ.logMatch(this.config,log);
+  if(!item)return;
+
+  const receipt=await this.pool.read('getTransactionReceipt',log.transactionHash);
+  if(!active()||!receipt)return;
+  validateReceipt(receipt,log.transactionHash);
+  if(receipt.status!==1)return;
+  const block=await this.pool.read('getBlock',receipt.blockNumber);
+  if(!active()||!SEC.receiptHasLog(log,receipt,block))return;
+
+  let tx={hash:log.transactionHash};
+  if(this.config.liquidityFrom||this.config.followLiquidityGas){
+   tx=SEC.signed(await this.transaction(log.transactionHash),this.config.chainId??8453);
+   if(!active()||!tx||lower(tx.from)!==lower(receipt.from))return;
+   if(this.config.liquidityFrom&&lower(tx.from)!==lower(this.config.liquidityFrom))return;
+  }
+  this.matched=true;
+  this.onMatch({reason:'匹配 '+item.action+'：'+item.poolId,followGas:this.config.followLiquidityGas===true,tx,poolId:item.poolId});
+ }
  async inspect(tx){
   const generation=this.connectionGeneration;
   if(!this.running||this.matched)return;
+  const adapter=liquidity(this.config);
+  if(adapter===V4_LIQ){
+   tx=SEC.signed(tx,this.config.chainId??8453);
+   if(!tx)return;
+  }
   let matched=matchTransaction(this.config,tx);
-  if(!matched){for(const item of LIQ.actions(this.config,tx)){
+  if(!matched){for(const item of adapter.actions(this.config,tx)){
    if(!item.tokenId)continue;const key=item.manager+':'+item.tokenId;
-   let tokens=this.positionCache.get(key);
-   if(!tokens){const iface=this.config.liquidityDex==='Aerodrome'?LIQ.positions:LIQ.v3Positions;const data=iface.encodeFunctionData('positions',[item.tokenId]);const raw=await this.pool.read('call',{to:item.manager,data});const r=iface.decodeFunctionResult('positions',raw);tokens=[r.token0,r.token1];if(this.positionCache.size>=1000)this.positionCache.clear();this.positionCache.set(key,tokens);}
-   if(LIQ.matches(this.config,{tokens})){matched={reason:'匹配添加流动性交易：'+item.action,followGas:this.config.followLiquidityGas===true,tx};break;}
+   let position=this.positionCache.get(key);
+   if(!position){
+    position=await adapter.position(this.config,item,this.pool);
+    if(position){if(this.positionCache.size>=1000)this.positionCache.clear();this.positionCache.set(key,position);}
+   }
+   if(position&&adapter.matches(this.config,position)){matched={reason:'匹配添加流动性交易：'+item.action,followGas:this.config.followLiquidityGas===true,tx};break;}
   }}
   if(this.running&&!this.matched&&generation===this.connectionGeneration&&matched){this.matched=true;this.onMatch(matched);}
  }

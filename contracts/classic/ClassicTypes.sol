@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.36;
+pragma solidity ^0.8.38;
 
 library ClassicTypes {
     uint8 internal constant UNI = 0;

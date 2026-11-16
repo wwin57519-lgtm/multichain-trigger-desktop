@@ -1,9 +1,10 @@
 const {validateReceipt, validateRecoveredTransaction, receiptFee}=require('./receipt-security.cjs');
 const crypto=require('node:crypto');
-const {Contract,Interface,formatUnits,keccak256,getAddress,ZeroAddress}=require('ethers');
+const {Contract,formatUnits,keccak256,getAddress,ZeroAddress}=require('ethers');
 const {CONFIG,addr,units,integer,cleanError,rpcUrl,RpcPool}=require('./runtime.cjs');
 const {Monitor}=require('./monitor.cjs');
 const DEX=require('./dex.cjs');
+const V4_DEX=require('./v4-dex.cjs');
 const CONTRACTS=require('./contract-artifacts.cjs');
 const {TaskWindow}=require('./task-window.cjs');
 const {performance}=require('node:perf_hooks');
@@ -40,7 +41,7 @@ class Engine{
  constructor({store,vault,artifact,providerFactory,monitorFactory,onEvent=()=>{},openExternal=()=>{},copyText=()=>{throw Error('本机剪贴板不可用');},importFile}={}){
   this.store=store;this.vault=vault;
   this.artifact=artifact||CONTRACTS.rebuiltArtifact;
-  this.iface=new Interface(this.artifact.abi);
+  this.executor=null;
   this.providerFactory=providerFactory;this.monitorFactory=monitorFactory;this.emit=onEvent;this.openExternal=openExternal;this.copyText=copyText;this.importFile=importFile;
   this.rootData=require('./network-state.cjs').migrate(store?.read?.()||{},store,'trigger');this.chain=CONFIG.forChain(this.rootData.selectedChainId);const data={...(this.rootData.networks[this.chain.chainId]||{}),journal:this.rootData.journal};this.config=data.config||{};this.journal=(data.journal||[]).map(r=>({...r,chainId:r.chainId??8453})).map(r=>r.status==='prepared'?{...r,status:'unknown'}:r.status==='superseded'&&!r.blockNumber?{...r,feeUnverified:true}:r);this.contract=null;this.pool=null;this.walletCache=new Map();this.contextBusy=false;this.pollBusy=false;this.run=null;this.startGeneration=0;
   this.task=data.task?{...data.task,status:'stopped',reason:'程序重启后不会自动恢复签名，请核对未确认交易后手动开始'}:{status:'idle',counters:{attempts:0,submitted:0,confirmed:0,reverted:0,pending:0}};
@@ -97,7 +98,7 @@ class Engine{
   this.store?.write?.(root);
   const previousPool=this.pool;
   this.rootData=root;this.chain=next;this.config=config;this.task=task;
-  this.startGeneration++;this.pool=null;this.contract=null;this.run=null;this.walletCache.clear();
+   this.startGeneration++;this.pool=null;this.contract=null;this.executor=null;this.run=null;this.walletCache.clear();
   try{previousPool?.destroy();}catch{}
   return this.info();}finally{this.switchingNetwork=false;}
  }
@@ -111,34 +112,77 @@ class Engine{
    const root={...this.rootData,selectedChainId:chain.chainId,networks:{...this.rootData.networks,[chain.chainId]:{config,task:this.task}},journal:this.journal};
    this.store?.write?.(root);
    const previousPool=this.pool;
-   pool.installLimiters();this.rootData=root;this.config=config;this.pool=pool;committed=true;this.contract=null;
+    pool.installLimiters();this.rootData=root;this.config=config;this.pool=pool;committed=true;this.contract=null;this.executor=null;
    try{previousPool?.destroy();}catch{}
    return{chainId:chain.chainId,blockNumber,endpoints,fees};
   }finally{if(!committed)pool.destroy();}
  }
  requirePool(){if(!this.pool)throw Error('请先测试连接当前网络 RPC');return this.pool;}
  async contractAt(raw){
-  const pool=this.requirePool(),target=addr(raw,'专属合约地址');
+   const pool=this.requirePool(),chain=this.chain,target=addr(raw,'专属合约地址');
   const code=await pool.read('getCode',target),matched=CONTRACTS.identifyExecutor(code,this.artifact);
   if(!matched)throw Error('该地址的运行时代码与支持的执行合约不匹配');
   const contract=new Contract(target,matched.artifact.abi,pool.primary);
-  Object.defineProperty(contract,'verifiedVersion',{value:matched.version});
-  await DEX.validateDependencies(contract,pool.primary,matched.helpers,{},this.chain);
+   const family=matched.family||'classic';
+   const dex=family==='v4'?V4_DEX:DEX;
+   await dex.validateDependencies(contract,pool.primary,matched.helpers,{},chain);
+   Object.defineProperties(contract,{
+    verifiedVersion:{value:matched.version},
+    verifiedFamily:{value:family},
+    strictTriggerLimits:{value:matched.strictTriggerLimits===true}
+   });
   return contract;
  }
- async inspect(raw){const generation=this.startGeneration,pool=this.pool;const c=await this.contractAt(raw);const [owner,executed,armed,epoch,policy,s,block]=await Promise.all([c.owner(),c.executed(),c.triggerArmed(),c.triggerEpoch(),c.getTriggerPolicy(),c.getSettings(),this.pool.read('getBlock','latest')]);const contract={address:await c.getAddress(),owner,executed,triggerArmed:armed,triggerEpoch:String(epoch),policy:{amountIn:String(policy.amountIn),slippageBps:Number(policy.slippageBps),notBefore:Number(policy.notBefore),expiresAt:Number(policy.expiresAt)},settings:{tokenIn:s.tokenIn,tokenOut:s.tokenOut,recipient:s.recipient,minBuyAmount:String(s.minBuyAmount)},supported:true,version:c.verifiedVersion,...await DEX.policy(c),blockTimestamp:block.timestamp,blockObservedAt:Date.now()};if(this.closed||generation!==this.startGeneration||pool!==this.pool)throw Error('合约读取上下文变化');this.contract=contract;this.config={...this.config,contractAddress:contract.address};return this.contract;}
- async refreshWallets(){if(!this.pool)return;const c=this.contract?new Contract(this.contract.address,this.artifact.abi,this.pool.primary):null;await mapLimit(this.vault.list(),4,async w=>{try{const [balance,authorized]=await Promise.all([this.pool.read('getBalance',w.address),c?c.isTriggerWallet(w.address):null]);this.walletCache.set(w.address.toLowerCase(),{balance:formatUnits(balance,18),authorized});}catch(e){this.walletCache.set(w.address.toLowerCase(),{error:cleanError(e)});}});this.emit({type:'wallets',wallets:this.publicWallets()});}
+  async inspect(raw){
+   const generation=this.startGeneration,pool=this.pool;
+   const executor=await this.contractAt(raw);
+   const family=executor.verifiedFamily;
+   const dex=family==='v4'?V4_DEX:DEX;
+   const [owner,executed,armed,epoch,policy,settings,block,protocol]=await Promise.all([
+    executor.owner(),executor.executed(),executor.triggerArmed(),executor.triggerEpoch(),
+    executor.getTriggerPolicy(),executor.getSettings(),pool.read('getBlock','latest'),dex.policy(executor)
+   ]);
+   const contract={
+    address:await executor.getAddress(),owner,executed,triggerArmed:armed,triggerEpoch:String(epoch),
+    policy:{
+     amountIn:String(policy.amountIn),slippageBps:Number(policy.slippageBps),
+     notBefore:Number(policy.notBefore),expiresAt:Number(policy.expiresAt)
+    },
+    settings:{
+     tokenIn:settings.tokenIn,tokenOut:settings.tokenOut,recipient:settings.recipient,
+     minBuyAmount:String(settings.minBuyAmount)
+    },
+    family,supported:true,strictTriggerLimits:executor.strictTriggerLimits,version:executor.verifiedVersion,...protocol,
+    blockTimestamp:block.timestamp,blockObservedAt:Date.now()
+   };
+   if(this.closed||generation!==this.startGeneration||pool!==this.pool)throw Error('合约读取上下文变化');
+   this.executor=executor;
+   this.contract=contract;
+   this.config={...this.config,contractAddress:contract.address};
+   return contract;
+  }
+  async refreshWallets(){if(!this.pool)return;const c=this.executor;await mapLimit(this.vault.list(),4,async w=>{try{const [balance,authorized]=await Promise.all([this.pool.read('getBalance',w.address),c?c.isTriggerWallet(w.address):null]);this.walletCache.set(w.address.toLowerCase(),{balance:formatUnits(balance,18),authorized});}catch(e){this.walletCache.set(w.address.toLowerCase(),{error:cleanError(e)});}});this.emit({type:'wallets',wallets:this.publicWallets()});}
  async prepare(raw){const config=normalize(raw,this.chain);if(!this.pool||JSON.stringify(this.pool.urls)!==JSON.stringify(config.rpcUrls)||this.pool.rps!==config.rpcRps)await this.connect(config.rpcUrls,config.rpcRps);const contract=await this.inspect(config.contractAddress);
-  if(config.mode==='listen'&&config.listenLiquidity){config.liquidityDex=contract.dex===1?'Aerodrome':contract.dex===2?'PancakeSwap':'Uniswap';if(contract.dex!==1){const dex=contract.dex===2?this.chain.pancake:this.chain.addresses;config.liquidityRouter=dex.v2Router;config.liquidityTargets=[dex.v2Router,contract.dex===2?dex.positionManager:this.chain.positionManager];}config.liquidityToken=config.liquidityToken||contract.settings.tokenOut;if(contract.dex===1){config.liquidityRouter=this.chain.aerodrome.router;config.liquidityTargets=[this.chain.aerodrome.router,...this.chain.aerodrome.cl.map(g=>g.positionManager)];config.positionIds={};const abi=['function positions(uint256) view returns(uint96,address,address token0,address token1,int24,int24,int24,uint128,uint256,uint256,uint128,uint128)','function balanceOf(address) view returns(uint256)','function tokenOfOwnerByIndex(address,uint256) view returns(uint256)'];
+   if(contract.strictTriggerLimits&&(BigInt(contract.policy.amountIn)<=0n||
+     BigInt(contract.settings.minBuyAmount)<=0n||contract.policy.slippageBps!==10000)){
+    throw Error('新版合约须由管理员设置正数投入金额和固定最低实收后开启本轮');
+   }
+   const executor=this.executor;
+   config.contractFamily=contract.family;
+   if(contract.family==='v4'){
+    config.liquidityDex=contract.dex===2?'PancakeSwap':'Uniswap';
+    config.v4Pools=contract.v4Pools;
+    config.lockedPoolId=contract.lockedPoolId;
+   }else if(config.mode==='listen'&&config.listenLiquidity){config.liquidityDex=contract.dex===1?'Aerodrome':contract.dex===2?'PancakeSwap':'Uniswap';if(contract.dex!==1){const dex=contract.dex===2?this.chain.pancake:this.chain.addresses;config.liquidityRouter=dex.v2Router;config.liquidityTargets=[dex.v2Router,contract.dex===2?dex.positionManager:this.chain.positionManager];}config.liquidityToken=config.liquidityToken||contract.settings.tokenOut;if(contract.dex===1){config.liquidityRouter=this.chain.aerodrome.router;config.liquidityTargets=[this.chain.aerodrome.router,...this.chain.aerodrome.cl.map(g=>g.positionManager)];config.positionIds={};const abi=['function positions(uint256) view returns(uint96,address,address token0,address token1,int24,int24,int24,uint128,uint256,uint256,uint128,uint128)','function balanceOf(address) view returns(uint256)','function tokenOfOwnerByIndex(address,uint256) view returns(uint256)'];
    if(config.liquidityFrom){for(const g of this.chain.aerodrome.cl){const m=new Contract(g.positionManager,abi,this.pool.primary),count=Number(await m.balanceOf(config.liquidityFrom));if(count>500)throw Error('添加者持有超过 500 个仓位；请缩小监听范围或使用自定义选择器');for(let i=0;i<count;i++){const id=await m.tokenOfOwnerByIndex(config.liquidityFrom,i),pos=await m.positions(id);if([pos.token0,pos.token1].some(a=>a.toLowerCase()===config.liquidityToken.toLowerCase()))(config.positionIds[g.positionManager.toLowerCase()]??=[]).push(String(id));}}}
-  }}if(!contract.triggerArmed)throw Error('合约尚未武装；请在部署工具中由所有者授权钱包并设置触发参数');if(contract.executed)throw Error('合约已经完成本轮买入，请先由所有者保存新设置并重新武装');const block=await this.pool.read('getBlock','latest'),observedMonotonic=performance.now(),observedAt=Date.now();if(!Number.isSafeInteger(contract.policy.expiresAt)||contract.policy.expiresAt<=0)throw Error('合约必须配置有效的链上截止时间');if(config.mode==='time'&&Date.parse(config.startTime)>=contract.policy.expiresAt*1000)throw Error('定时开始必须早于本轮链上截止时间');if(contract.policy.expiresAt<=block.timestamp)throw Error('触发授权已到期，需要所有者重新武装');const all=this.vault.list();if(!all.length)throw Error('请在本机导入或解锁触发钱包');if(config.walletLimit>all.length)throw Error(`只导入了 ${all.length} 个钱包，请调整钱包数量`);const selected=all.slice(0,config.walletLimit);const c=new Contract(contract.address,this.artifact.abi,this.pool.primary);const cap=BigInt(config.gasLimit)*(config.gasMode==='legacy'?units(config.gasPriceGwei,9):units(config.maxFeeGwei,9));
-  const details=await mapLimit(selected,4,async w=>{const [authorized,balance]=await Promise.all([c.isTriggerWallet(w.address),this.pool.read('getBalance',w.address)]);const pending=this.journal.some(r=>(r.chainId??8453)===this.chain.chainId&&OPEN.has(r.status)&&r.from.toLowerCase()===w.address.toLowerCase());const detail={address:w.address,authorized,balance:formatUnits(balance,18),pending,ready:authorized&&balance>=cap&&!pending};this.walletCache.set(w.address.toLowerCase(),detail);return detail;});
+   }}if(!contract.triggerArmed)throw Error('合约尚未武装；请在部署工具中由所有者授权钱包并设置触发参数');if(contract.executed)throw Error('合约已经完成本轮买入，请先由所有者保存新设置并重新武装');const block=await this.pool.read('getBlock','latest'),observedMonotonic=performance.now(),observedAt=Date.now();if(!Number.isSafeInteger(contract.policy.expiresAt)||contract.policy.expiresAt<=0)throw Error('合约必须配置有效的链上截止时间');if(config.mode==='time'&&Date.parse(config.startTime)>=contract.policy.expiresAt*1000)throw Error('定时开始必须早于本轮链上截止时间');if(contract.policy.expiresAt<=block.timestamp)throw Error('触发授权已到期，需要所有者重新武装');const all=this.vault.list();if(!all.length)throw Error('请在本机导入或解锁触发钱包');if(config.walletLimit>all.length)throw Error(`只导入了 ${all.length} 个钱包，请调整钱包数量`);const selected=all.slice(0,config.walletLimit);const cap=BigInt(config.gasLimit)*(config.gasMode==='legacy'?units(config.gasPriceGwei,9):units(config.maxFeeGwei,9));
+   const details=await mapLimit(selected,4,async w=>{const [authorized,balance]=await Promise.all([executor.isTriggerWallet(w.address),this.pool.read('getBalance',w.address)]);const pending=this.journal.some(r=>(r.chainId??8453)===this.chain.chainId&&OPEN.has(r.status)&&r.from.toLowerCase()===w.address.toLowerCase());const detail={address:w.address,authorized,balance:formatUnits(balance,18),pending,ready:authorized&&balance>=cap&&!pending};this.walletCache.set(w.address.toLowerCase(),detail);return detail;});
   const ready=details.filter(w=>w.ready);if(!ready.length)throw Error('没有可用触发钱包：检查链上授权、原生币余额和未确认交易');
   config.liquidityToken=config.liquidityToken||contract.settings.tokenOut;
-  return{config,contract,details,ready,cap,block,observedMonotonic,observedAt};
+   return{config,contract,executor,details,ready,cap,block,observedMonotonic,observedAt};
  }
  async preview(raw){const p=await this.prepare(raw);this.config=p.config;this.persist();return{canStart:true,contract:p.contract,wallets:p.details,selectedWalletCount:p.details.length,authorizedWalletCount:p.details.filter(w=>w.authorized).length,readyWalletCount:p.ready.length,perTransactionGasEth:formatUnits(p.cap,18),maxPendingGasEth:formatUnits(p.cap*BigInt(Math.min(p.config.concurrency,p.ready.length)),18),gasBudgetEth:p.config.gasBudgetEth,mode:p.config.mode,summary:'预览只读取状态，不会签名或发送交易。Gas 金额为执行费用上限，不包含 L1 等额外费用。'};}
- async start(raw){const generation=++this.startGeneration;const p=await this.prepare(raw);if(generation!==this.startGeneration)throw Error('启动已取消');const window=new TaskWindow(p.contract.policy,p.block,{observedMonotonic:p.observedMonotonic,observedAt:p.observedAt});if(window.expired())throw Error('启动准备期间本轮已到期，请重新设置有效期');const config=p.config;this.config=config;const id=crypto.randomUUID();this.run={id,active:true,config,contract:p.contract,epoch:p.contract.triggerEpoch,wallets:p.details.filter(w=>w.authorized).map(w=>w.address),cursor:0,busyWallets:new Set(),busyReserve:0n,preparing:0,operations:new Set(),gate:config.mode==='block'&&BigInt(config.startBlock)===0n,nextAt:Date.now(),nextProbe:0,matched:null,window,chainTime:p.block.timestamp,blockNumber:p.block.number,warningAt:0};
+  async start(raw){const generation=++this.startGeneration;const p=await this.prepare(raw);if(generation!==this.startGeneration)throw Error('启动已取消');const window=new TaskWindow(p.contract.policy,p.block,{observedMonotonic:p.observedMonotonic,observedAt:p.observedAt});if(window.expired())throw Error('启动准备期间本轮已到期，请重新设置有效期');const config=p.config;this.config=config;const id=crypto.randomUUID();const triggerData=p.executor.interface.encodeFunctionData('trigger',[p.contract.triggerEpoch]);this.run={id,active:true,config,contract:p.contract,executor:p.executor,triggerData,epoch:p.contract.triggerEpoch,wallets:p.details.filter(w=>w.authorized).map(w=>w.address),cursor:0,busyWallets:new Set(),busyReserve:0n,preparing:0,operations:new Set(),gate:config.mode==='block'&&BigInt(config.startBlock)===0n,nextAt:Date.now(),nextProbe:0,matched:null,window,chainTime:p.block.timestamp,blockNumber:p.block.number,warningAt:0};
   this.task={id,chainId:this.chain.chainId,status:'armed',mode:config.mode,startedAt:new Date().toISOString(),contractAddress:config.contractAddress,epoch:p.contract.triggerEpoch,reason:'等待触发条件',counters:{attempts:0,submitted:0,confirmed:0,reverted:0,pending:0},executionGasSpentEth:'0',executionGasReservedEth:'0'};this.persist();this.updateTask();this.scheduleExpiry(this.run);
   try{if(config.mode==='listen'){const args={url:config.monitorRpc,feed:config.listenFeed,pool:this.pool,config,onMatch:m=>{const run=this.run;if(!run?.active||run.id!==id||run.matched)return;run.matched=m;run.nextAt=Date.now()+config.delaySeconds*1000;run.gate=true;this.log(m.reason+'，按设定延迟开始触发','info');run.monitor.stop();},onLog:(m,l)=>this.log(m,l),onFatal:e=>this.fail(e)};this.run.monitor=this.monitorFactory?this.monitorFactory(args):new Monitor(args);await this.run.monitor.start();}
    if(!this.run.active)return this.task;this.run.timer=setInterval(()=>this.tick().catch(e=>this.fail(e)),Math.min(50,config.intervalMs,config.probeIntervalMs));this.run.timer.unref?.();await this.tick();return this.task;
@@ -151,7 +195,7 @@ class Engine{
  updateTask(){const run=this.run;if(run){const records=this.journal.filter(r=>r.taskId===run.id),a=this.task.archived||{};this.task.counters={attempts:(a.attempts||0)+records.length,submitted:(a.submitted||0)+records.filter(r=>r.accepted).length,confirmed:(a.confirmed||0)+records.filter(r=>r.status==='confirmed').length,reverted:(a.reverted||0)+records.filter(r=>r.status==='reverted').length,pending:records.filter(r=>OPEN.has(r.status)).length,feesUnverified:records.filter(r=>r.feeUnverified).length};const b=this.budgetUsed(run);this.task.executionGasSpentEth=formatUnits(b.spent,18);this.task.executionGasReservedEth=formatUnits(b.reserved,18);this.task.executionGasUnverifiedEth=formatUnits(b.unverified,18);this.task.nextAt=run.nextAt;Object.assign(this.task,run.window.state());}this.emit({type:'task',task:this.task});}
  async tick(){const run=this.run;if(!run?.active||run.tickBusy)return;run.tickBusy=true;
   try{const c=run.config;const now=Date.now();if(!this.canSend(run))return;if(run.chainTime<run.contract.policy.notBefore)return;
-   if(!run.gate){if(c.mode==='block')run.gate=BigInt(run.blockNumber)>=BigInt(c.startBlock);else if(c.mode==='time')run.gate=now>=Date.parse(c.startTime);else if(c.mode==='probe'&&now>=run.nextProbe){run.nextProbe=now+c.probeIntervalMs;const w=run.wallets.find(a=>!this.walletPending(a));if(w){try{await this.pool.read('call',{to:c.contractAddress,from:w,data:this.iface.encodeFunctionData('trigger',[run.epoch]),gasLimit:BigInt(c.gasLimit)});run.gate=true;this.log('当前状态嗅探可执行，开始发送','info');}catch(e){if(now-run.warningAt>10000){this.log('尚不可买入，继续嗅探：'+cleanError(e),'info');run.warningAt=now;}}}}
+    if(!run.gate){if(c.mode==='block')run.gate=BigInt(run.blockNumber)>=BigInt(c.startBlock);else if(c.mode==='time')run.gate=now>=Date.parse(c.startTime);else if(c.mode==='probe'&&now>=run.nextProbe){run.nextProbe=now+c.probeIntervalMs;const w=run.wallets.find(a=>!this.walletPending(a));if(w){try{await this.pool.read('call',{to:c.contractAddress,from:w,data:run.triggerData,gasLimit:BigInt(c.gasLimit)});run.gate=true;this.log('当前状态嗅探可执行，开始发送','info');}catch(e){if(now-run.warningAt>10000){this.log('尚不可买入，继续嗅探：'+cleanError(e),'info');run.warningAt=now;}}}}
     if(!run.gate)return;
    }
    if(!this.canSend(run)||now<run.nextAt)return;
@@ -167,7 +211,7 @@ class Engine{
  }
  walletPending(address){return this.journal.some(r=>(r.chainId??8453)===this.chain.chainId&&OPEN.has(r.status)&&r.from.toLowerCase()===address.toLowerCase());}
  async sendOne(run,from,fees,ticket){const p=this.pool,c=run.config;const [latest,pending,balance,block]=await Promise.all([p.read('getTransactionCount',from,'latest'),p.read('getTransactionCount',from,'pending'),p.read('getBalance',from),p.read('getBlock','latest')]);run.window.observe(block);run.chainTime=run.window.chainTimestamp;if(!this.canSend(run))return;if(pending!==latest){this.walletCache.set(from.toLowerCase(),{...this.walletCache.get(from.toLowerCase()),error:'该钱包存在其他待确认 nonce，轮换跳过'});return;}if(balance<ticket.reserve){this.walletCache.set(from.toLowerCase(),{...this.walletCache.get(from.toLowerCase()),error:'ETH 不足以覆盖本次 Gas 上限'});return;}if(block.baseFeePerGas!=null&&(fees.gasPrice??fees.maxFeePerGas)<block.baseFeePerGas){if(Date.now()-run.warningAt>5000){this.log('设置的费率上限低于当前网络基础费，暂缓提交','warn');run.warningAt=Date.now();}return;}
-  const transaction={chainId:this.chain.chainId,to:c.contractAddress,value:0n,data:this.iface.encodeFunctionData('trigger',[run.epoch]),nonce:pending,gasLimit:BigInt(c.gasLimit),...fees};
+   const transaction={chainId:this.chain.chainId,to:c.contractAddress,value:0n,data:run.triggerData,nonce:pending,gasLimit:BigInt(c.gasLimit),...fees};
   const raw=await this.vault.getSigner(from).signTransaction(transaction);if(!this.canSend(run))return;
   const hash=keccak256(raw);const serializable=Object.fromEntries(Object.entries(transaction).map(([k,v])=>[k,typeof v==='bigint'?String(v):v]));
   const record={hash,chainId:this.chain.chainId,taskId:run.id,epoch:run.epoch,from,to:c.contractAddress,nonce:pending,status:'prepared',accepted:false,reserveFee:String(ticket.reserve),executionFee:'0',createdAt:new Date().toISOString(),tx:serializable};this.journal.push(record);if(ticket.preparing){run.preparing--;ticket.preparing=false;}
@@ -190,7 +234,7 @@ class Engine{
    }catch(e){r.lastCheckError=cleanError(e);}
    if(r.feeUnverified){r.receiptCheckFailures=(r.receiptCheckFailures||0)+1;r.nextReceiptCheckAt=Date.now()+Math.min(30000,1000*2**Math.min(r.receiptCheckFailures,5));changed=true;}
    if(OPEN.has(r.status)&&!r.feeUnverified&&r.status!=='prepared'&&this.run?.active&&this.run.id===r.taskId&&Date.now()>=(r.nextRetry||Date.parse(r.createdAt)+5000)){const retryRun=this.run;const operation=this.retryRecord(r,retryRun);retryRun.operations.add(operation);try{await operation;}finally{retryRun.operations.delete(operation);}changed=true;}});
-  const run=this.run;if(run?.active){const c=new Contract(run.config.contractAddress,this.artifact.abi,this.pool.primary);const [executed,epoch,block]=await Promise.all([c.executed(),c.triggerEpoch(),this.pool.read('getBlock','latest')]);if(run.active){run.window.observe(block);run.chainTime=run.window.chainTimestamp;run.blockNumber=block.number;if(executed)await this.stop('链上已完成买入，停止后续提交','completed');else if(String(epoch)!==run.epoch)await this.stop('链上本轮已结束或已更换；旧任务停止');else this.canSend(run);}}
+   const run=this.run;if(run?.active){const c=run.executor;const [executed,epoch,block]=await Promise.all([c.executed(),c.triggerEpoch(),this.pool.read('getBlock','latest')]);if(run.active){run.window.observe(block);run.chainTime=run.window.chainTimestamp;run.blockNumber=block.number;if(executed)await this.stop('链上已完成买入，停止后续提交','completed');else if(String(epoch)!==run.epoch)await this.stop('链上本轮已结束或已更换；旧任务停止');else this.canSend(run);}}
   if(changed){this.persist();this.emit({type:'journal',journal:this.publicJournal()});this.emit({type:'wallets',wallets:this.publicWallets()});}this.updateTask();
  }finally{this.pollBusy=false;}}
  async retryRecord(r,run){const pool=this.pool;if(r.retrying||r.feeUnverified||!OPEN.has(r.status)||!this.canSend(run)||!this.vault.has(r.from))return;if(BigInt(r.tx?.chainId??0)!==BigInt(this.chain.chainId)){r.error='重试记录链标识不符，停止签名';await this.stop(r.error,'error');return;}r.retrying=true;try{const raw=await this.vault.getSigner(r.from).signTransaction(r.tx);if(!this.canSend(run))return;if(keccak256(raw).toLowerCase()!==r.hash.toLowerCase())return;const response=await pool.broadcast(raw,run.cursor%pool.providers.length,()=>this.canSend(run));if(OPEN.has(r.status)){r.accepted=true;r.status='pending';}r.rpcAttempts=[...(r.rpcAttempts||[]),...(response.attempts||[])].slice(-20);}catch(e){r.rpcAttempts=[...(r.rpcAttempts||[]),...(e.attempts||[])].slice(-20);if(OPEN.has(r.status))r.error=cleanError(e);}finally{r.retrying=false;r.retries=(r.retries||0)+1;r.nextRetry=Date.now()+Math.min(60000,2000*2**Math.min(r.retries,5));this.persist();}}

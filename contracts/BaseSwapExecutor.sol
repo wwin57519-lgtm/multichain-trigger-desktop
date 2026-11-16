@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity 0.8.36;
+pragma solidity 0.8.38;
 
 import {TradeCore} from "./common/TradeCore.sol";
 import {TokenOps} from "./common/TokenOps.sol";
@@ -168,14 +168,14 @@ contract BaseSwapExecutor is TradeCore {
         return _settings.minBuyAmount;
     }
 
-    function _executeTrade(uint256 amountIn, uint256 requestedMinimum, uint256 deadline, uint16 autoSlippageBps, bool automatic)
+    function _executeTrade(uint256 amountIn, uint256 requestedMinimum, uint256 deadline)
         internal
         override
         returns (uint256 bought, uint256 received, uint256 testInputRecovered)
     {
         Types.Settings memory current = _settings;
         (Types.Route memory best,) = aerodromeQuoteHelper.quote(current, amountIn, dex, v3Fees, _spacings);
-        uint256 minimum = _executionMinimum(best.amountOut, requestedMinimum, autoSlippageBps, automatic);
+        uint256 minimum = _executionMinimum(requestedMinimum);
         TaxExecutionResult memory result = _trade(current, best, amountIn, minimum, deadline);
         emit Bought(best.kind, best.pool, best.fee, amountIn, best.amountOut, result.bought, result.received, result.recovered);
         return (result.bought, result.received, result.recovered);
